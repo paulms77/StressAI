@@ -8,6 +8,17 @@ The point of the project is not the classifier. It is the path from **raw
 wearable CSV → cleaned, aligned, labelled signal → database → trained model →
 running service**, with the signal-processing stage carrying most of the weight.
 
+The target is deliberately narrow: not a general stress classifier, but a
+**real-time detector of contextual anomalies** — a sharp change against this
+person's own recent baseline. That reframing is what makes the sliding-window
+and per-subject scaling choices below the right ones.
+
+![Live Stress Detection System dashboard — real-time EDA, BVP and stress plots updating as data streams in](docs/media/dashboard-demo.gif)
+
+*The dashboard replaying a recording: EDA and BVP stream in while the stress
+prediction updates alongside. Full clip:
+[`docs/media/dashboard-demo.mp4`](docs/media/dashboard-demo.mp4).*
+
 ---
 
 ## Table of contents
@@ -15,6 +26,7 @@ running service**, with the signal-processing stage carrying most of the weight.
 - [Pipeline](#pipeline)
 - [Signal processing](#signal-processing)
 - [Models](#models)
+- [Results](#results)
 - [Data](#data)
 - [Setup](#setup)
 - [Usage](#usage)
@@ -67,8 +79,13 @@ signal, and those segments are removed (`remove_constant_segments`, threshold
 filter shifts the signal in time, and a time-shifted signal against fixed
 protocol labels means every window is slightly mislabelled.
 
-**Labelling.** The recording protocol alternates rest and task blocks, with
-durations in minutes:
+**Labelling.** The recording protocol alternates rest and task blocks, each task
+a different stressor — timed assembly with and without instructions, mental
+arithmetic, and an oral CV presentation:
+
+![Data collection protocol — alternating rest and task blocks](docs/media/collection-protocol.png)
+
+In minutes:
 
 | Block | Rest 1 | Task 1 | Rest 2 | Task 2 | Rest 3 | Task 3 | Rest 4 | Task 4 | Rest 5 | Task 5 | Rest 6 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -76,6 +93,39 @@ durations in minutes:
 
 Samples are labelled by which block they fall in — `Rest → 0`, `Task → 1` —
 converting minutes to sample counts at each channel's own rate.
+
+### The full preprocessing flow
+
+![Preprocessing pipeline — EDA and PPG branches converging into the database](docs/media/preprocessing-pipeline.png)
+
+The two channels take different routes. EDA is upsampled, padded, low-pass
+filtered and stripped of constant segments. PPG is Chebyshev II filtered, then
+peak-detected, and the **peak-to-peak interval is validated against a
+600–1200 ms window** — intervals outside that range are not plausible heart
+beats, so those segments are rejected rather than cleaned. What survives both
+branches is concatenated and written to the database.
+
+### Sensor dropout, before and after
+
+| Raw EDA | After `remove_constant_segments` |
+| --- | --- |
+| ![raw EDA signal with a long flat run](docs/media/eda-raw.png) | ![EDA signal with the constant run removed](docs/media/eda-processed.png) |
+
+The flat line from ~68,000 samples onward is not a calm participant — it is the
+sensor stuck at a constant value. Left in, the model would learn that a
+perfectly steady signal means "rest". Roughly half the recording is discarded
+here, which is the right trade.
+
+### Windowing and scaling
+
+A plain train/validation split is wrong for a real-time detector, so the signal
+is cut into **sliding windows of 64 × 5 = 320 samples** — five seconds at 64 Hz
+— each window carrying a continuous stretch of behaviour rather than an isolated
+reading.
+
+**Min-max scaling is applied to normalise between participants.** Baseline skin
+conductance differs enormously from person to person; without rescaling, the
+model learns who someone is rather than whether they are stressed.
 
 ## Models
 
@@ -87,12 +137,25 @@ head. The straightforward baseline for a time series.
 
 **`StressTransformer`** — linear embedding to 128 dims, 2 `TransformerEncoder`
 layers with 4 attention heads, mean-pooled over time, linear head. This is what
-is actually served.
+is actually served, chosen over the LSTM for its handling of long-range
+dependence across the window.
 
 Training ([`train.py`](train.py)) runs **per subject, sequentially**, each
-subject's model initialised from the previous subject's weights — a simple
-sequential fine-tune across 29 subjects rather than one pooled fit. 10 epochs
-per subject, Adam at 1e-3, cross-entropy.
+subject's model initialised from the previous subject's weights — a fine-tune
+chain across 29 participants rather than one pooled fit. `CrossEntropyLoss`,
+Adam, 10 epochs per subject.
+
+Hyperparameters after tuning:
+
+| Parameter | Initial | Final |
+| --- | --- | --- |
+| Batch size | 32 | **64** |
+| Hidden dim | 64 | **256** |
+| Embedding dim | 64 | **128** |
+| Attention heads | 8 | **4** |
+
+No learning-rate scheduler — worth adding if convergence degrades late in
+training, but it was not needed at this scale.
 
 ## Data
 
@@ -167,8 +230,17 @@ The uploaded CSV needs `eda` and `bvp` columns. It is cut into 320-sample
 python dashboard.py     # Dash on http://localhost:8050
 ```
 
-Replays a recording one second at a time, plotting EDA and BVP alongside the
-rolling stress prediction.
+Replays a recording one second at a time (`dcc.Interval`), plotting EDA and BVP
+alongside the rolling stress prediction, plus model accuracy and loss.
+
+![Live Stress Detection System dashboard](docs/media/dashboard.png)
+
+**Why Dash is the primary surface, not FastAPI.** Both exist in this repository,
+but the dashboard is the one that matters. FastAPI is the better fit for
+request/response inference; it gives you nothing for *watching* a signal. This
+project is about noticing a stress spike as it happens, which is a visualisation
+problem — and Dash builds the whole interactive front end from Python alone, with
+no separate frontend to write. On a three-week build, that decided it.
 
 ### Reproduce from raw recordings
 
@@ -197,6 +269,22 @@ fine_tuned_model.pt trained StressTransformer weights
 data/               expected location of recordings (not included)
 ```
 
+## Results
+
+**~70% accuracy** under the constraints described above — a single wristband,
+29 participants, and training on a free-tier T4.
+
+That is enough to flag the sharp, obvious stress transitions and not much more.
+The honest reading is that it detects large changes reliably and subtle ones
+poorly, which is consistent with what two channels from a consumer wristband can
+carry.
+
+What would move it: a wider age range in the participant pool, a revised
+protocol designed to reduce the ambiguous middle ground (see
+[Limitations](#limitations)), and more compute than a free T4 allows. The
+intended direction is to use the class probability as a graded stress *level*
+rather than a binary flag, and attach guidance to each level.
+
 ## Limitations
 
 **Binary labels come from the protocol, not from the participant.** A sample is
@@ -210,9 +298,9 @@ subjects carry more influence and the final weights are biased toward the end of
 the sequence. A pooled fit with subject-wise cross-validation would be the
 sounder comparison.
 
-**No held-out subject evaluation.** The training loop reports loss only. Honest
-numbers for this task require leave-one-subject-out validation, since
-within-subject windows are heavily correlated and any random split leaks.
+**The reported accuracy is not leave-one-subject-out.** Within-subject windows
+are heavily correlated, so any split that is not subject-wise leaks. The ~70%
+figure should be read as indicative, not as generalisation to an unseen person.
 
 ## License
 
