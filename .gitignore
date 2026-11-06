@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Biosignal recordings — not redistributed (see data/README.md)
+data/Subjects/
+data/Subjects_processing/
+*.csv
+
+# Scalers / derived artefacts
+*.pkl
+
+# OS
+.DS_Store

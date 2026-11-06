@@ -1,0 +1,32 @@
+# Core
+numpy
+pandas
+scipy
+scikit-learn
+joblib
+
+# Model
+torch
+
+# Signal processing
+pyedflib
+
+# Serving
+fastapi
+uvicorn
+python-multipart
+pydantic
+
+# Dashboard
+dash
+plotly
+
+# Database
+pymysql
+sqlalchemy
+
+# Misc
+openpyxl
+xgboost
+matplotlib
+seaborn
